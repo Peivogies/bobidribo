@@ -1,35 +1,37 @@
 import asyncio
 import os
-import tempfile
-from dataclasses import dataclass, field
-from typing import Deque, Optional, List
-from collections import deque
-
 import random
+import re
+from dataclasses import dataclass, field
+from typing import Deque, Optional
+from collections import deque
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument
-from telethon.errors import UsernameNotOccupiedError
 from dotenv import load_dotenv
-
 from yt_dlp import YoutubeDL
-import re
+
+# ────────────────────────────────────────────────────────────────────────────
+# Конфиг
+# ────────────────────────────────────────────────────────────────────────────
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
-TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL")  # например: @my_music_channel
+TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL")
 TEMP_DIR = os.getenv("TEMP_DIR", ".cache")
+TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "tg_session_server")
 
 if not all([DISCORD_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_CHANNEL]):
     raise RuntimeError("Заполните DISCORD_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_CHANNEL в .env")
+
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 YDL_OPTS = {
     "format": "bestaudio/best",
@@ -37,26 +39,38 @@ YDL_OPTS = {
     "noplaylist": True,
     "extract_flat": False,
     "default_search": "ytsearch",
+    "geo_bypass": True,
 }
 YOUTUBE_URL_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", re.I)
+YTDLP_COOKIES = os.getenv("YTDLP_COOKIES")
+if YTDLP_COOKIES and os.path.exists(YTDLP_COOKIES):
+    YDL_OPTS["cookiefile"] = YTDLP_COOKIES
 
-os.makedirs(TEMP_DIR, exist_ok=True)
+# ────────────────────────────────────────────────────────────────────────────
+# Discord bot
+# ────────────────────────────────────────────────────────────────────────────
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# --- Telegram client (один на процесс) ---
-TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "tg_session_server")
+# ────────────────────────────────────────────────────────────────────────────
+# Telethon client
+# ────────────────────────────────────────────────────────────────────────────
+
 tele_client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
-# --- Очередь треков на сервер (гильдию) ---
+# ────────────────────────────────────────────────────────────────────────────
+# Модель данных
+# ────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class Track:
     title: str
-    filepath: Optional[str] = None           # локальный файл (TG)
-    source_msg_id: Optional[int] = None
-    stream_url: Optional[str] = None         # прямой поток (YouTube)
+    filepath: Optional[str] = None        # локальный файл (TG)
+    source_msg_id: Optional[int] = None   # id сообщения TG
+    stream_url: Optional[str] = None      # прямой поток (YouTube)
 
 @dataclass
 class GuildPlayer:
@@ -64,25 +78,21 @@ class GuildPlayer:
     queue: Deque[Track] = field(default_factory=deque)
     now_playing: Optional[Track] = None
     play_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    loop_current: bool = False  # <— НОВОЕ: зацикливать текущий трек
-    voice: Optional[discord.VoiceClient] = None
-    queue: Deque[Track] = field(default_factory=deque)
-    now_playing: Optional[Track] = None
-    play_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    loop_current: bool = False            # зацикливать текущий трек
 
 players: dict[int, GuildPlayer] = {}
 
 SUPPORTED_AUDIO_MIME_PREFIXES = ("audio/",)
 SUPPORTED_EXTS = {".mp3", ".m4a", ".ogg", ".flac", ".wav"}
 
+# ────────────────────────────────────────────────────────────────────────────
+# Хелперы
+# ────────────────────────────────────────────────────────────────────────────
+
 def channel_has_listeners(vc: Optional[discord.VoiceClient]) -> bool:
-    """Есть ли в голосовом канале хоть один не-бот кроме нашего бота."""
     if not vc or not vc.channel:
         return False
-    for m in vc.channel.members:
-        if not m.bot:
-            return True
-    return False
+    return any(not m.bot for m in vc.channel.members)
 
 async def ensure_player(guild: discord.Guild) -> GuildPlayer:
     if guild.id not in players:
@@ -94,14 +104,9 @@ async def get_tg_entity():
     if not chan:
         raise RuntimeError("TELEGRAM_CHANNEL пуст")
     try:
-        # принимает @username И полные t.me-ссылки (включая invite)
         return await tele_client.get_entity(chan)
     except Exception as e:
         raise RuntimeError(f"Не удалось получить канал по TELEGRAM_CHANNEL='{chan}': {e}")
-
-# и в search_telegram_audios замените:
-# entity = await tele_client.get_entity(TELEGRAM_CHANNEL)
-
 
 async def connect_to_author_channel(interaction: discord.Interaction) -> discord.VoiceClient:
     if not interaction.user or not isinstance(interaction.user, discord.Member):
@@ -118,12 +123,7 @@ async def connect_to_author_channel(interaction: discord.Interaction) -> discord
     return player.voice
 
 async def search_telegram_audios(query: Optional[str], limit: int = 20):
-    # Ищем сообщения с документами-аудио
-    try:
-        entity = await get_tg_entity()   # <-- ВЫЗОВ ТУТ, внутри async-функции
-    except Exception as e:
-        raise RuntimeError(str(e))
-
+    entity = await get_tg_entity()
     results = []
     async for msg in tele_client.iter_messages(entity, search=query or None, limit=200):
         if isinstance(msg.media, MessageMediaDocument) and msg.file:
@@ -138,36 +138,47 @@ async def search_telegram_audios(query: Optional[str], limit: int = 20):
     return results
 
 async def download_audio(msg, title: str) -> str:
-    # Скачиваем в TEMP_DIR с безопасным именем
     safe = "".join(c for c in title if c.isalnum() or c in " _-()[]{}.,!")
     base = safe or f"audio_{msg.id}"
     tmp_path = os.path.join(TEMP_DIR, f"{base}_{msg.id}")
-    path = await tele_client.download_media(msg, file=tmp_path)
-    return path
+    return await tele_client.download_media(msg, file=tmp_path)
+
+async def collect_all_tg_audios(max_items: int = 2000) -> list[tuple]:
+    """
+    Собирает до max_items аудио-документов из TELEGRAM_CHANNEL.
+    Возвращает список пар (msg, title).
+    """
+    entity = await get_tg_entity()
+    results = []
+    async for msg in tele_client.iter_messages(entity, limit=max_items):
+        if isinstance(msg.media, MessageMediaDocument) and msg.file:
+            mime = getattr(msg.file, "mime_type", "") or ""
+            name = msg.file.name or f"audio_{msg.id}"
+            ext = os.path.splitext(name)[1].lower()
+            if mime.startswith(SUPPORTED_AUDIO_MIME_PREFIXES) or ext in SUPPORTED_EXTS:
+                title = (msg.message or name).strip()[:200] if msg.message else name
+                results.append((msg, title))
+    return results
 
 async def ytdlp_resolve(query: str) -> tuple[str, str]:
-    """
-    Возвращает (title, direct_audio_url) для YouTube.
-    Поддерживает: прямая ссылка на видео, плейлист (берёт первый), текстовый поиск.
-    """
     with YoutubeDL(YDL_OPTS) as ydl:
         info = ydl.extract_info(query, download=False)
         if "entries" in info and info["entries"]:
             info = info["entries"][0]
         title = info.get("title") or "YouTube Audio"
         direct_url = info.get("url")
-
         if not direct_url:
-            # запасной путь: из форматов берём любой аудио-поток
             for f in reversed(info.get("formats") or []):
                 if f.get("acodec") and f.get("url"):
                     direct_url = f["url"]
                     break
-
         if not direct_url:
             raise RuntimeError("Не удалось получить прямой аудио-URL (YouTube)")
-
         return title, direct_url
+
+# ────────────────────────────────────────────────────────────────────────────
+# Воспроизведение
+# ────────────────────────────────────────────────────────────────────────────
 
 async def play_next(guild: discord.Guild):
     player = await ensure_player(guild)
@@ -186,8 +197,10 @@ async def play_next(guild: discord.Guild):
 
     if not player.queue and player.loop_current and player.now_playing:
         t = player.now_playing
-        looped = Track(title=t.title, filepath=t.filepath, source_msg_id=t.source_msg_id, stream_url=t.stream_url)
-        player.queue.appendleft(looped)
+        player.queue.appendleft(
+            Track(title=t.title, filepath=t.filepath,
+                  source_msg_id=t.source_msg_id, stream_url=t.stream_url)
+        )
 
     if not player.queue:
         player.now_playing = None
@@ -195,111 +208,60 @@ async def play_next(guild: discord.Guild):
 
     track = player.queue.popleft()
     player.now_playing = track
-    # если это TG-трек, у которого ещё нет локального файла — докачаем прямо сейчас
-    if getattr(track, "filepath", None) is None and getattr(track, "source_msg_id", None) is not None:
+
+    if track.filepath is None and track.source_msg_id is not None:
         try:
             entity = await get_tg_entity()
             msg = await tele_client.get_messages(entity, ids=track.source_msg_id)
             path = await download_audio(msg, track.title)
             track.filepath = path
         except Exception as e:
-            print(f"Не удалось скачать TG-трек {track.title}: {e}")
-            # пробуем перейти к следующему
+            print(f"[play_next] не удалось скачать TG-трек '{track.title}': {e}")
             fut = asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
+            try:
+                fut.result()
+            except Exception as ee:
+                print("[play_next] ошибка при планировании следующего:", ee)
             return
 
-    async def collect_all_tg_audios(max_items: int = 2000) -> list[tuple]:
-        """
-        Собирает до max_items аудиосообщений/документов из TELEGRAM_CHANNEL.
-        Возвращает список (msg, title).
-        """
-        entity = await get_tg_entity()
-        results = []
-        # идём от новых к старым; увеличь limit, если хочешь быстрее (но не все клиенты переварят 10k+)
-        async for msg in tele_client.iter_messages(entity, limit=max_items):
-            if isinstance(msg.media, MessageMediaDocument) and msg.file:
-                mime = getattr(msg.file, "mime_type", "") or ""
-                name = msg.file.name or f"audio_{msg.id}"
-                ext = os.path.splitext(name)[1].lower()
-                if mime.startswith(SUPPORTED_AUDIO_MIME_PREFIXES) or ext in SUPPORTED_EXTS:
-                    title = (msg.message or name).strip()[:200] if msg.message else name
-                    results.append((msg, title))
-        return results
-
-    def after_play(err):
+    def after_play(err: Optional[Exception]):
         if err:
-            print(f"FFmpeg error: {err}")
+            print(f"[FFmpeg error]: {err}")
         fut = asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
         try:
             fut.result()
-        except Exception as e:
-            print("play_next error:", e)
+        except Exception as ee:
+            print("[play_next] ошибка при планировании следующего:", ee)
 
     reconnect_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 
     if track.filepath:
-        source = discord.FFmpegPCMAudio(track.filepath, before_options='-nostdin', options='-vn')
+        source = discord.FFmpegPCMAudio(
+            track.filepath,
+            before_options='-nostdin',
+            options='-vn'
+        )
     elif track.stream_url:
-        source = discord.FFmpegPCMAudio(track.stream_url, before_options=f"-nostdin {reconnect_opts}", options='-vn')
+        source = discord.FFmpegPCMAudio(
+            track.stream_url,
+            before_options=f"-nostdin {reconnect_opts}",
+            options='-vn'
+        )
     else:
-        print("track без источника, пропуск")
-        asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
-        return
-
-    vc.play(source, after=after_play)
-
-    def after_play(err):
-        if err:
-            print(f"FFmpeg error: {err}")
+        print(f"[play_next] у трека '{track.title}' нет источника (filepath/stream_url)")
         fut = asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
         try:
             fut.result()
-        except Exception as e:
-            print("play_next error:", e)
-
-    reconnect_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-
-    if getattr(track, "filepath", None):
-        source = discord.FFmpegPCMAudio(track.filepath, before_options='-nostdin', options='-vn')
-    elif getattr(track, "stream_url", None):
-        source = discord.FFmpegPCMAudio(track.stream_url, before_options=f"-nostdin {reconnect_opts}", options='-vn')
-    else:
-        print("track без источника, пропуск")
-        fut = asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
+        except Exception as ee:
+            print("[play_next] ошибка при планировании следующего:", ee)
         return
 
     vc.play(source, after=after_play)
 
-async def _cmd_shuffle_all(interaction: discord.Interaction, limit: Optional[int] = None):
-    """
-    Собирает ВСЕ (или до limit) аудио из TG, перемешивает, ставит в очередь.
-    Скачивание аудио будет непосредственно перед проигрыванием.
-    """
-    await interaction.response.defer(thinking=True)
-    await connect_to_author_channel(interaction)
-    player = await ensure_player(interaction.guild)
+# ────────────────────────────────────────────────────────────────────────────
+# СЛЭШ-КОМАНДЫ
+# ────────────────────────────────────────────────────────────────────────────
 
-    # сколько максимума собирать
-    max_items = limit or 100  # можно менять по вкусу
-    all_tracks = await collect_all_tg_audios (max_items=max_items)
-    if not all_tracks:
-        await interaction.followup.send("В канале не найдено ни одного аудио.")
-        return
-
-    random.shuffle(all_tracks)
-
-    # кладём в очередь «лёгкие» объекты (без предзагрузки файла)
-    added = 0
-    async with player.play_lock:
-        for msg, title in all_tracks:
-            player.queue.append(Track(title=title, source_msg_id=msg.id))  # filepath=None, докачаем в play_next
-            added += 1
-
-    await interaction.followup.send(f"Перемешал и добавил в очередь {added} трек(ов). Поехали! 🔀")
-    await play_next(interaction.guild)
-
-# --- СЛЭШ-КОМАНДЫ ---
-# ==== COMMAND HELPERS =========================================================
 async def _cmd_join(interaction: discord.Interaction):
     vc = await connect_to_author_channel(interaction)
     await interaction.response.send_message(f"Подключился к: **{vc.channel.name}**")
@@ -317,8 +279,8 @@ async def _cmd_play(interaction: discord.Interaction, query: str):
         path = await download_audio(msg, title)
         track = Track(title=title, filepath=path, source_msg_id=msg.id)
         player.queue.append(track)
-        await interaction.followup.send(f"Добавлено в очередь: **{track.title}**")
-        await play_next(interaction.guild)
+    await interaction.followup.send(f"Добавлено в очередь: **{track.title}**")
+    await play_next(interaction.guild)
 
 async def _cmd_latest(interaction: discord.Interaction, n: Optional[int] = 10):
     await interaction.response.defer(thinking=True)
@@ -376,208 +338,103 @@ async def _cmd_stop(interaction: discord.Interaction):
         player.voice.stop()
     await interaction.response.send_message("⏹️ Остановил и очистил очередь")
 
-async def _cmd_loop(interaction: discord.Interaction, enabled: bool = True):
+async def _cmd_loop(interaction: discord.Interaction):
     player = await ensure_player(interaction.guild)
-    if not player.voice or not player.voice.is_connected():
-        await interaction.response.send_message("Бот не в голосовом канале. Сначала /join.", ephemeral=True)
-        return
-    if not player.now_playing and not player.queue:
-        await interaction.response.send_message("Нечего зацикливать — очередь пуста.", ephemeral=True)
-        return
-    player.loop_current = bool(enabled)
-    await interaction.response.send_message("🔁 Повтор включён" if enabled else "⏹️ Повтор выключен")
-    await play_next(interaction.guild)
+    player.loop_current = not player.loop_current
+    await interaction.response.send_message(
+        f"🔁 Зацикливание текущего трека: **{'включено' if player.loop_current else 'выключено'}**"
+    )
 
-async def _cmd_loopstatus(interaction: discord.Interaction):
-    player = await ensure_player(interaction.guild)
-    state = "включён 🔁" if player.loop_current else "выключен ⏹️"
-    np = f" | сейчас: **{player.now_playing.title}**" if player.now_playing else ""
-    await interaction.response.send_message(f"Повтор {state}{np}")
-# =============================================================================
-
-@tree.command(name="yt", description="Воспроизвести аудиодорожку с YouTube (поиск или ссылка)")
-@app_commands.describe(query="Запрос поиска или URL YouTube")
-async def yt(interaction: discord.Interaction, query: str):
+async def _cmd_yt(interaction: discord.Interaction, query: str):
     await interaction.response.defer(thinking=True)
+    await connect_to_author_channel(interaction)
+    player = await ensure_player(interaction.guild)
     try:
-        await connect_to_author_channel(interaction)
-        player = await ensure_player(interaction.guild)
-
-        title, direct_url = await ytdlp_resolve(query)
-        async with player.play_lock:
-            track = Track(title=title, stream_url=direct_url)
-            player.queue.append(track)
-            await interaction.followup.send(f"Добавлено с YouTube: **{track.title}**")
-            await play_next(interaction.guild)
+        title, direct_url = await asyncio.get_event_loop().run_in_executor(None, ytdlp_resolve, query)
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка YouTube: {e}")
-
-@tree.command(name="ютуб", description="Воспроизвести аудиодорожку с YouTube (поиск или ссылка)")
-@app_commands.describe(запрос="Запрос поиска или URL YouTube")
-async def ютуб(interaction: discord.Interaction, запрос: str):
-    await yt(interaction, запрос)  # просто прокси на yt
-
-@tree.command(name="join", description="Join your voice channel")
-async def join(interaction: discord.Interaction):
-    try:
-        await _cmd_join(interaction)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-
-@tree.command(name="shuffleall", description="Shuffle and queue all audios from the Telegram channel")
-@app_commands.describe(limit="Max items to scan (default 100)")
-async def shuffleall(interaction: discord.Interaction, limit: Optional[int] = None):
-    try:
-        await _cmd_shuffle_all(interaction, limit)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка: {e}")
-
-@tree.command(name="перемешать", description="Перемешать и поставить в очередь все аудио из TG-канала")
-@app_commands.describe(limit="Максимум для сканирования (по умолчанию 2000)")
-async def перемешать(interaction: discord.Interaction, limit: Optional[int] = None):
-    try:
-        await _cmd_shuffle_all(interaction, limit)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка: {e}")
-
-@tree.command(name="зайти", description="Зайти в ваш голосовой канал")
-async def зайти(interaction: discord.Interaction):
-    try:
-        await _cmd_join(interaction)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-
-# PLAY
-@tree.command(name="play", description="Play from Telegram channel by query")
-@app_commands.describe(query="Search text")
-async def play(interaction: discord.Interaction, query: str):
-    try:
-        await _cmd_play(interaction, query)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка: {e}")
-
-@tree.command(name="воспроизвести", description="Воспроизвести трек из Telegram-канала по запросу")
-@app_commands.describe(запрос="Название/фраза для поиска")
-async def воспроизвести(interaction: discord.Interaction, запрос: str):
-    try:
-        await _cmd_play(interaction, запрос)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка: {e}")
-
-# LATEST
-@tree.command(name="latest", description="Show last N audios from Telegram")
-@app_commands.describe(n="How many (default 10)")
-async def latest(interaction: discord.Interaction, n: Optional[int] = 10):
-    try:
-        await _cmd_latest(interaction, n)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка: {e}")
-
-@tree.command(name="последние", description="Показать последние N треков из Telegram-канала")
-@app_commands.describe(n="Сколько показать (по умолчанию 10)")
-async def последние(interaction: discord.Interaction, n: Optional[int] = 10):
-    try:
-        await _cmd_latest(interaction, n)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Ошибка: {e}")
-
-# QUEUE
-@tree.command(name="queue", description="Show queue")
-async def queue(interaction: discord.Interaction):
-    await _cmd_queue(interaction)
-
-@tree.command(name="очередь", description="Показать очередь")
-async def очередь(interaction: discord.Interaction):
-    await _cmd_queue(interaction)
-
-# SKIP
-@tree.command(name="skip", description="Skip current track")
-async def skip(interaction: discord.Interaction):
-    await _cmd_skip(interaction)
-
-@tree.command(name="пропустить", description="Пропустить текущий трек")
-async def пропустить(interaction: discord.Interaction):
-    await _cmd_skip(interaction)
-
-# PAUSE / RESUME
-@tree.command(name="pause", description="Pause")
-async def pause(interaction: discord.Interaction):
-    await _cmd_pause(interaction)
-
-@tree.command(name="пауза", description="Пауза")
-async def пауза(interaction: discord.Interaction):
-    await _cmd_pause(interaction)
-
-@tree.command(name="resume", description="Resume")
-async def resume(interaction: discord.Interaction):
-    await _cmd_resume(interaction)
-
-@tree.command(name="продолжить", description="Продолжить")
-async def продолжить(interaction: discord.Interaction):
-    await _cmd_resume(interaction)
-
-# STOP
-@tree.command(name="stop", description="Stop and clear queue")
-async def stop(interaction: discord.Interaction):
-    await _cmd_stop(interaction)
-
-@tree.command(name="остановить", description="Остановить и очистить очередь")
-async def остановить(interaction: discord.Interaction):
-    await _cmd_stop(interaction)
-
-# LOOP
-@tree.command(name="loop", description="Loop current track while listeners exist")
-@app_commands.describe(enabled="Enable or disable")
-async def loop(interaction: discord.Interaction, enabled: Optional[bool] = True):
-    await _cmd_loop(interaction, enabled)
-
-@tree.command(name="повтор", description="Зациклить текущий трек (пока есть слушатели)")
-@app_commands.describe(вкл="True — включить, False — выключить")
-async def повтор(interaction: discord.Interaction, вкл: Optional[bool] = True):
-    await _cmd_loop(interaction, bool(вкл))
-
-# LOOP STATUS
-@tree.command(name="loopstatus", description="Show loop status")
-async def loopstatus(interaction: discord.Interaction):
-    await _cmd_loopstatus(interaction)
-
-@tree.command(name="повторстатус", description="Показать состояние повтора")
-async def повторстатус(interaction: discord.Interaction):
-    await _cmd_loopstatus(interaction)
-
-async def debug_telegram_startup_check():
-    print("=== TELETHON DEBUG START ===")
-    print("TELEGRAM_CHANNEL =", repr(TELEGRAM_CHANNEL))
-
-    # 1) Проверяем — подключён ли Telethon
-    if not tele_client.is_connected():
-        print("Telethon: not connected — connecting...")
-        await tele_client.connect()
-
-    # 2) Проверяем авторизацию (нужно login через номер)
-    if not await tele_client.is_user_authorized():
-        print("❌ Telethon НЕ авторизован — нужно перезапустить и войти через номер!")
-        print("=== TELETHON DEBUG END ===")
         return
-    else:
-        me = await tele_client.get_me()
-        print(f"✅ Telethon авторизован как: {me.first_name} (@{me.username}) id={me.id}")
+    async with player.play_lock:
+        player.queue.append(Track(title=title, stream_url=direct_url))
+    await interaction.followup.send(f"Добавлено из YouTube: **{title}**")
+    await play_next(interaction.guild)
 
-    # 3) Пробуем получить канал/группу
-    try:
-        entity = await get_tg_entity()
-        print(f"✅ Канал/группа доступна: id={entity.id}, title='{getattr(entity,'title',None)}'")
-    except Exception as e:
-        print("❌ Ошибка получения канала:", e)
+async def _cmd_shuffle_all(interaction: discord.Interaction, limit: Optional[int] = None):
+    """
+    Собирает ВСЕ (или до limit) аудио из TG, перемешивает, ставит в очередь.
+    Скачивание — непосредственно перед проигрыванием.
+    """
+    await interaction.response.defer(thinking=True)
+    await connect_to_author_channel(interaction)
+    player = await ensure_player(interaction.guild)
 
-    print("=== TELETHON DEBUG END ===")
+    max_items = limit or 100
+    all_tracks = await collect_all_tg_audios(max_items=max_items)
+    if not all_tracks:
+        await interaction.followup.send("В канале не найдено ни одного аудио.")
+        return
+
+    random.shuffle(all_tracks)
+
+    added = 0
+    async with player.play_lock:
+        for msg, title in all_tracks:
+            player.queue.append(Track(title=title, source_msg_id=msg.id))
+            added += 1
+
+    await interaction.followup.send(f"Перемешал и добавил в очередь {added} трек(ов). Поехали! 🔀")
+    await play_next(interaction.guild)
+
+# ────────────────────────────────────────────────────────────────────────────
+# Регистрация слэш-команд
+# ────────────────────────────────────────────────────────────────────────────
+
+@tree.command(name="join", description="Зайти в ваш голосовой канал")
+async def join_cmd(interaction: discord.Interaction): await _cmd_join(interaction)
+
+@tree.command(name="play", description="Воспроизвести трек из Telegram по запросу")
+@app_commands.describe(query="Название/фраза для поиска")
+async def play_cmd(interaction: discord.Interaction, query: str): await _cmd_play(interaction, query)
+
+@tree.command(name="latest", description="Показать последние N треков из Telegram-канала")
+@app_commands.describe(n="Сколько показать (по умолчанию 10)")
+async def latest_cmd(interaction: discord.Interaction, n: Optional[int] = 10): await _cmd_latest(interaction, n)
+
+@tree.command(name="queue", description="Показать очередь воспроизведения")
+async def queue_cmd(interaction: discord.Interaction): await _cmd_queue(interaction)
+
+@tree.command(name="skip", description="Пропустить текущий трек")
+async def skip_cmd(interaction: discord.Interaction): await _cmd_skip(interaction)
+
+@tree.command(name="pause", description="Пауза")
+async def pause_cmd(interaction: discord.Interaction): await _cmd_pause(interaction)
+
+@tree.command(name="resume", description="Продолжить")
+async def resume_cmd(interaction: discord.Interaction): await _cmd_resume(interaction)
+
+@tree.command(name="stop", description="Остановить и очистить очередь")
+async def stop_cmd(interaction: discord.Interaction): await _cmd_stop(interaction)
+
+@tree.command(name="loop", description="Вкл/выкл зацикливание текущего трека")
+async def loop_cmd(interaction: discord.Interaction): await _cmd_loop(interaction)
+
+@tree.command(name="yt", description="Воспроизвести звук с YouTube (по ссылке или поиску)")
+@app_commands.describe(query="Ссылка на YouTube или запрос для поиска")
+async def yt_cmd(interaction: discord.Interaction, query: str): await _cmd_yt(interaction, query)
+
+@tree.command(name="shuffleall", description="Перемешать и добавить все треки из TG-канала")
+@app_commands.describe(limit="Сколько максимум собрать (по умолчанию 100)")
+async def shuffleall_cmd(interaction: discord.Interaction, limit: Optional[int] = None):
+    await _cmd_shuffle_all(interaction, limit)
+
+# ────────────────────────────────────────────────────────────────────────────
+# Запуск
+# ────────────────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
-    # запускаем Telegram клиент, если ещё не запущен
     if not tele_client.is_connected():
-        # start() запустит интерактивный логин, если сессии нет
-        await tele_client.start()
+        await tele_client.connect()
     try:
         await tree.sync()
         print(f"Синхронизированы слэш-команды для {bot.user}")
@@ -590,12 +447,14 @@ async def main():
         await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    # Инициализируем Telegram клиент заранее, чтобы создать сессию
     async def run():
-        await tele_client.start()
+        await tele_client.connect()
         await main()
     try:
         asyncio.run(run())
     finally:
-        if tele_client.is_connected():
-            asyncio.run(tele_client.disconnect())
+        try:
+            if tele_client.is_connected():
+                asyncio.run(tele_client.disconnect())
+        except RuntimeError:
+            pass
