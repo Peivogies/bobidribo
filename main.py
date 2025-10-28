@@ -47,7 +47,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # --- Telegram client (один на процесс) ---
-tele_client = TelegramClient("tg_session", TELEGRAM_API_ID, TELEGRAM_API_HASH)
+TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "tg_session_server")
+tele_client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 # --- Очередь треков на сервер (гильдию) ---
 @dataclass
@@ -280,7 +281,7 @@ async def _cmd_shuffle_all(interaction: discord.Interaction, limit: Optional[int
 
     # сколько максимума собирать
     max_items = limit or 100  # можно менять по вкусу
-    all_tracks = await collect_all_tg_audios(max_items=max_items)
+    all_tracks = await collect_all_tg_audios (max_items=max_items)
     if not all_tracks:
         await interaction.followup.send("В канале не найдено ни одного аудио.")
         return
